@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Helper to resolve issues with configs that have SPI enabled but I2C
+# modular, meaning we can't build the codec driver in with I2C support.
+# We use an ordered list of conditional defaults to pick the appropriate
+# setting - SPI can't be modular so that case doesn't need to be covered.
+config SND_SOC_I2C_AND_SPI
+	tristate
+	default m if I2C=m
+	default y if I2C=y
+	default y if SPI_MASTER=y
+
+menu "CODEC drivers"
+
+config SND_SOC_ALL_CODECS
+	imply SND_SOC_ES8316
+	help
+	  Normally ASoC codec drivers are only built if a machine driver which
+	  uses them is also built since they are only usable with a machine
+	  driver.  Selecting this option will allow these drivers to be built
+	  without an explicit machine driver for test and development purposes.
+
+	  Support for the bus types used to access the codecs to be built must
+	  be selected separately.
+
+	  If unsure select "N".
+
+config SND_SOC_ES8316
+	tristate "Everest Semi ES8316 CODEC"
+	depends on I2C
+
+endmenu
