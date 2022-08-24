@@ -16,8 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this software.  If not, see <https://www.gnu.org/licenses/>.
 #
-obj-m :=	./src/snd-soc-sof_es8336.o \
-		./src/snd-soc-es8316.o
+obj-m :=	./src/snd-soc-sof_es8336.o
 
 PWD := $(shell pwd)
 KDIR := /lib/modules/$(shell uname -r)/build
