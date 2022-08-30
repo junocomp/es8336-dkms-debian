@@ -1,9 +1,4 @@
-#
-# Copyright (c) 2018-2020 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
-#
-# This file is part of tuxedo-keyboard.
-#
-# tuxedo-keyboard is free software: you can redistribute it and/or modify
+# es8336-dkms is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
@@ -20,6 +15,7 @@ obj-m :=	./src/sof_es8336.o
 
 PWD := $(shell pwd)
 KDIR := /lib/modules/$(shell uname -r)/build
+CFLAGS = "-Wno-error=format-truncation"
 
 all:
 	make -C $(KDIR) M=$(PWD) modules
