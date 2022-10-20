@@ -1,705 +1,894 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright(c) 2021 Intel Corporation.
-
 /*
- * Intel SOF Machine Driver with es8336 Codec
+ * es8316.c -- es8316 ALSA SoC audio driver
+ * Copyright Everest Semiconductor Co.,Ltd
+ *
+ * Authors: David Yang <yangxiaohua@everest-semi.com>,
+ *          Daniel Drake <drake@endlessm.com>
  */
-#include <linux/device.h>
-#include <linux/dmi.h>
-#include <linux/gpio/consumer.h>
-#include <linux/gpio/machine.h>
-#include <linux/i2c.h>
-#include <linux/input.h>
+
 #include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-#include <sound/jack.h>
+#include <linux/acpi.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/i2c.h>
+#include <linux/mod_devicetable.h>
+#include <linux/mutex.h>
+#include <linux/regmap.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
-#include <sound/soc-acpi.h>
-#include "codecs/hda_dsp_common.h"
+#include <sound/soc-dapm.h>
+#include <sound/tlv.h>
+#include <sound/jack.h>
+#include "es8316.h"
 
-/* jd-inv + terminating entry */
-#define MAX_NO_PROPS 2
-
-#define SOF_ES8336_SSP_CODEC(quirk)		((quirk) & GENMASK(3, 0))
-#define SOF_ES8336_SSP_CODEC_MASK		(GENMASK(3, 0))
-
-#define SOF_ES8336_SPEAKERS_EN_GPIO1_QUIRK	BIT(4)
-#define SOF_ES8336_ENABLE_DMIC			BIT(5)
-#define SOF_ES8336_JD_INVERTED			BIT(6)
-#define SOF_ES8336_HEADPHONE_GPIO		BIT(7)
-#define SOC_ES8336_HEADSET_MIC1			BIT(8)
-
-static unsigned long quirk;
-
-static int quirk_override = -1;
-module_param_named(quirk, quirk_override, int, 0444);
-MODULE_PARM_DESC(quirk, "Board-specific quirk override");
-
-struct sof_es8336_private {
-	struct device *codec_dev;
-	struct gpio_desc *gpio_speakers, *gpio_headphone;
-	struct snd_soc_jack jack;
-	struct list_head hdmi_pcm_list;
-	bool speaker_en;
+/* In slave mode at single speed, the codec is documented as accepting 5
+ * MCLK/LRCK ratios, but we also add ratio 400, which is commonly used on
+ * Intel Cherry Trail platforms (19.2MHz MCLK, 48kHz LRCK).
+ */
+#define NR_SUPPORTED_MCLK_LRCK_RATIOS 6
+static const unsigned int supported_mclk_lrck_ratios[] = {
+	256, 384, 400, 512, 768, 1024
 };
 
-struct sof_hdmi_pcm {
-	struct list_head head;
-	struct snd_soc_dai *codec_dai;
-	int device;
+struct es8316_priv {
+	struct mutex lock;
+	struct clk *mclk;
+	struct regmap *regmap;
+	struct snd_soc_component *component;
+	struct snd_soc_jack *jack;
+	int irq;
+	unsigned int sysclk;
+	unsigned int allowed_rates[NR_SUPPORTED_MCLK_LRCK_RATIOS];
+	struct snd_pcm_hw_constraint_list sysclk_constraints;
+	bool jd_inverted;
 };
-
-static const struct acpi_gpio_params enable_gpio0 = { 0, 0, true };
-static const struct acpi_gpio_params enable_gpio1 = { 1, 0, true };
-
-static const struct acpi_gpio_mapping acpi_speakers_enable_gpio0[] = {
-	{ "speakers-enable-gpios", &enable_gpio0, 1 },
-	{ }
-};
-
-static const struct acpi_gpio_mapping acpi_speakers_enable_gpio1[] = {
-	{ "speakers-enable-gpios", &enable_gpio1, 1 },
-};
-
-static const struct acpi_gpio_mapping acpi_enable_both_gpios[] = {
-	{ "speakers-enable-gpios", &enable_gpio0, 1 },
-	{ "headphone-enable-gpios", &enable_gpio1, 1 },
-	{ }
-};
-
-static const struct acpi_gpio_mapping acpi_enable_both_gpios_rev_order[] = {
-	{ "speakers-enable-gpios", &enable_gpio1, 1 },
-	{ "headphone-enable-gpios", &enable_gpio0, 1 },
-	{ }
-};
-
-static const struct acpi_gpio_mapping *gpio_mapping = acpi_speakers_enable_gpio0;
-
-static void log_quirks(struct device *dev)
-{
-	dev_info(dev, "quirk mask %#lx\n", quirk);
-	dev_info(dev, "quirk SSP%ld\n",  SOF_ES8336_SSP_CODEC(quirk));
-	if (quirk & SOF_ES8336_ENABLE_DMIC)
-		dev_info(dev, "quirk DMIC enabled\n");
-	if (quirk & SOF_ES8336_SPEAKERS_EN_GPIO1_QUIRK)
-		dev_info(dev, "Speakers GPIO1 quirk enabled\n");
-	if (quirk & SOF_ES8336_HEADPHONE_GPIO)
-		dev_info(dev, "quirk headphone GPIO enabled\n");
-	if (quirk & SOF_ES8336_JD_INVERTED)
-		dev_info(dev, "quirk JD inverted enabled\n");
-	if (quirk & SOC_ES8336_HEADSET_MIC1)
-		dev_info(dev, "quirk headset at mic1 port enabled\n");
-}
-
-static int sof_es8316_speaker_power_event(struct snd_soc_dapm_widget *w,
-					  struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_card *card = w->dapm->card;
-	struct sof_es8336_private *priv = snd_soc_card_get_drvdata(card);
-
-	if (priv->speaker_en == !SND_SOC_DAPM_EVENT_ON(event))
-		return 0;
-
-	priv->speaker_en = !SND_SOC_DAPM_EVENT_ON(event);
-
-	if (SND_SOC_DAPM_EVENT_ON(event))
-		msleep(70);
-
-	gpiod_set_value_cansleep(priv->gpio_speakers, priv->speaker_en);
-
-	if (!(quirk & SOF_ES8336_HEADPHONE_GPIO))
-		return 0;
-
-	if (SND_SOC_DAPM_EVENT_ON(event))
-		msleep(70);
-
-	gpiod_set_value_cansleep(priv->gpio_headphone, priv->speaker_en);
-
-	return 0;
-}
-
-static const struct snd_soc_dapm_widget sof_es8316_widgets[] = {
-	SND_SOC_DAPM_SPK("Speaker", NULL),
-	SND_SOC_DAPM_HP("Headphone", NULL),
-	SND_SOC_DAPM_MIC("Headset Mic", NULL),
-	SND_SOC_DAPM_MIC("Internal Mic", NULL),
-
-	SND_SOC_DAPM_SUPPLY("Speaker Power", SND_SOC_NOPM, 0, 0,
-			    sof_es8316_speaker_power_event,
-			    SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
-};
-
-static const struct snd_soc_dapm_widget dmic_widgets[] = {
-	SND_SOC_DAPM_MIC("SoC DMIC", NULL),
-};
-
-static const struct snd_soc_dapm_route sof_es8316_audio_map[] = {
-	{"Headphone", NULL, "HPOL"},
-	{"Headphone", NULL, "HPOR"},
-
-	/*
-	 * There is no separate speaker output instead the speakers are muxed to
-	 * the HP outputs. The mux is controlled Speaker and/or headphone switch.
-	 */
-	{"Speaker", NULL, "HPOL"},
-	{"Speaker", NULL, "HPOR"},
-	{"Speaker", NULL, "Speaker Power"},
-};
-
-static const struct snd_soc_dapm_route sof_es8316_headset_mic2_map[] = {
-	{"MIC1", NULL, "Internal Mic"},
-	{"MIC2", NULL, "Headset Mic"},
-};
-
-static const struct snd_soc_dapm_route sof_es8316_headset_mic1_map[] = {
-	{"MIC2", NULL, "Internal Mic"},
-	{"MIC1", NULL, "Headset Mic"},
-};
-
-static const struct snd_soc_dapm_route dmic_map[] = {
-	/* digital mics */
-	{"DMic", NULL, "SoC DMIC"},
-};
-
-static const struct snd_kcontrol_new sof_es8316_controls[] = {
-	SOC_DAPM_PIN_SWITCH("Speaker"),
-	SOC_DAPM_PIN_SWITCH("Headphone"),
-	SOC_DAPM_PIN_SWITCH("Headset Mic"),
-	SOC_DAPM_PIN_SWITCH("Internal Mic"),
-};
-
-static struct snd_soc_jack_pin sof_es8316_jack_pins[] = {
-	{
-		.pin	= "Headphone",
-		.mask	= SND_JACK_HEADPHONE,
-	},
-	{
-		.pin	= "Headset Mic",
-		.mask	= SND_JACK_MICROPHONE,
-	},
-};
-
-static int dmic_init(struct snd_soc_pcm_runtime *runtime)
-{
-	struct snd_soc_card *card = runtime->card;
-	int ret;
-
-	ret = snd_soc_dapm_new_controls(&card->dapm, dmic_widgets,
-					ARRAY_SIZE(dmic_widgets));
-	if (ret) {
-		dev_err(card->dev, "DMic widget addition failed: %d\n", ret);
-		return ret;
-	}
-
-	ret = snd_soc_dapm_add_routes(&card->dapm, dmic_map,
-				      ARRAY_SIZE(dmic_map));
-	if (ret)
-		dev_err(card->dev, "DMic map addition failed: %d\n", ret);
-
-	return ret;
-}
-
-static int sof_hdmi_init(struct snd_soc_pcm_runtime *runtime)
-{
-	struct sof_es8336_private *priv = snd_soc_card_get_drvdata(runtime->card);
-	struct snd_soc_dai *dai = asoc_rtd_to_codec(runtime, 0);
-	struct sof_hdmi_pcm *pcm;
-
-	pcm = devm_kzalloc(runtime->card->dev, sizeof(*pcm), GFP_KERNEL);
-	if (!pcm)
-		return -ENOMEM;
-
-	/* dai_link id is 1:1 mapped to the PCM device */
-	pcm->device = runtime->dai_link->id;
-	pcm->codec_dai = dai;
-
-	list_add_tail(&pcm->head, &priv->hdmi_pcm_list);
-
-	return 0;
-}
-
-static int sof_es8316_init(struct snd_soc_pcm_runtime *runtime)
-{
-	struct snd_soc_component *codec = asoc_rtd_to_codec(runtime, 0)->component;
-	struct snd_soc_card *card = runtime->card;
-	struct sof_es8336_private *priv = snd_soc_card_get_drvdata(card);
-	const struct snd_soc_dapm_route *custom_map;
-	int num_routes;
-	int ret;
-
-	card->dapm.idle_bias_off = true;
-
-	if (quirk & SOC_ES8336_HEADSET_MIC1) {
-		custom_map = sof_es8316_headset_mic1_map;
-		num_routes = ARRAY_SIZE(sof_es8316_headset_mic1_map);
-	} else {
-		custom_map = sof_es8316_headset_mic2_map;
-		num_routes = ARRAY_SIZE(sof_es8316_headset_mic2_map);
-	}
-
-	ret = snd_soc_dapm_add_routes(&card->dapm, custom_map, num_routes);
-	if (ret)
-		return ret;
-
-	ret = snd_soc_card_jack_new_pins(card, "Headset",
-					 SND_JACK_HEADSET | SND_JACK_BTN_0,
-					 &priv->jack, sof_es8316_jack_pins,
-					 ARRAY_SIZE(sof_es8316_jack_pins));
-	if (ret) {
-		dev_err(card->dev, "jack creation failed %d\n", ret);
-		return ret;
-	}
-
-	snd_jack_set_key(priv->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
-
-	snd_soc_component_set_jack(codec, &priv->jack, NULL);
-
-	return 0;
-}
-
-static void sof_es8316_exit(struct snd_soc_pcm_runtime *rtd)
-{
-	struct snd_soc_component *component = asoc_rtd_to_codec(rtd, 0)->component;
-
-	snd_soc_component_set_jack(component, NULL, NULL);
-}
-
-static int sof_es8336_quirk_cb(const struct dmi_system_id *id)
-{
-	quirk = (unsigned long)id->driver_data;
-
-	if (quirk & SOF_ES8336_HEADPHONE_GPIO) {
-		if (quirk & SOF_ES8336_SPEAKERS_EN_GPIO1_QUIRK)
-			gpio_mapping = acpi_enable_both_gpios;
-		else
-			gpio_mapping = acpi_enable_both_gpios_rev_order;
-	} else if (quirk & SOF_ES8336_SPEAKERS_EN_GPIO1_QUIRK) {
-		gpio_mapping = acpi_speakers_enable_gpio1;
-	}
-
-	return 1;
-}
 
 /*
- * this table should only be used to add GPIO or jack-detection quirks
- * that cannot be detected from ACPI tables. The SSP and DMIC
- * information are providing by the platform driver and are aligned
- * with the topology used.
- *
- * If the GPIO support is missing, the quirk parameter can be used to
- * enable speakers. In that case it's recommended to keep the SSP and DMIC
- * information consistent, overriding the SSP and DMIC can only be done
- * if the topology file is modified as well.
+ * ES8316 controls
  */
-static const struct dmi_system_id sof_es8336_quirk_table[] = {
-	{
-		.callback = sof_es8336_quirk_cb,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "IP3 tech"),
-			DMI_MATCH(DMI_BOARD_NAME, "WN1"),
-		},
-		.driver_data = (void *)(SOF_ES8336_SPEAKERS_EN_GPIO1_QUIRK)
-	},
-	{
-		.callback = sof_es8336_quirk_cb,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "HUAWEI"),
-			DMI_MATCH(DMI_BOARD_NAME, "BOHB-WAX9-PCB-B2"),
-		},
-		.driver_data = (void *)(SOF_ES8336_HEADPHONE_GPIO |
-					SOC_ES8336_HEADSET_MIC1)
-	},
-	{}
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(dac_vol_tlv, -9600, 50, 1);
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(adc_vol_tlv, -9600, 50, 1);
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(alc_max_gain_tlv, -650, 150, 0);
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(alc_min_gain_tlv, -1200, 150, 0);
+static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(alc_target_tlv, -1650, 150, 0);
+static const SNDRV_CTL_TLVD_DECLARE_DB_RANGE(hpmixer_gain_tlv,
+	0, 4, TLV_DB_SCALE_ITEM(-1200, 150, 0),
+	8, 11, TLV_DB_SCALE_ITEM(-450, 150, 0),
+);
+
+static const SNDRV_CTL_TLVD_DECLARE_DB_RANGE(adc_pga_gain_tlv,
+	0, 0, TLV_DB_SCALE_ITEM(-350, 0, 0),
+	1, 1, TLV_DB_SCALE_ITEM(0, 0, 0),
+	2, 2, TLV_DB_SCALE_ITEM(250, 0, 0),
+	3, 3, TLV_DB_SCALE_ITEM(450, 0, 0),
+	4, 7, TLV_DB_SCALE_ITEM(700, 300, 0),
+	8, 10, TLV_DB_SCALE_ITEM(1800, 300, 0),
+);
+
+static const SNDRV_CTL_TLVD_DECLARE_DB_RANGE(hpout_vol_tlv,
+	0, 0, TLV_DB_SCALE_ITEM(-4800, 0, 0),
+	1, 3, TLV_DB_SCALE_ITEM(-2400, 1200, 0),
+);
+
+static const char * const ng_type_txt[] =
+	{ "Constant PGA Gain", "Mute ADC Output" };
+static const struct soc_enum ng_type =
+	SOC_ENUM_SINGLE(ES8316_ADC_ALC_NG, 6, 2, ng_type_txt);
+
+static const char * const adcpol_txt[] = { "Normal", "Invert" };
+static const struct soc_enum adcpol =
+	SOC_ENUM_SINGLE(ES8316_ADC_MUTE, 1, 2, adcpol_txt);
+static const char *const dacpol_txt[] =
+	{ "Normal", "R Invert", "L Invert", "L + R Invert" };
+static const struct soc_enum dacpol =
+	SOC_ENUM_SINGLE(ES8316_DAC_SET1, 0, 4, dacpol_txt);
+
+static const struct snd_kcontrol_new es8316_snd_controls[] = {
+	SOC_DOUBLE_TLV("Headphone Playback Volume", ES8316_CPHP_ICAL_VOL,
+		       4, 0, 3, 1, hpout_vol_tlv),
+	SOC_DOUBLE_TLV("Headphone Mixer Volume", ES8316_HPMIX_VOL,
+		       4, 0, 11, 0, hpmixer_gain_tlv),
+
+	SOC_ENUM("Playback Polarity", dacpol),
+	SOC_DOUBLE_R_TLV("DAC Playback Volume", ES8316_DAC_VOLL,
+			 ES8316_DAC_VOLR, 0, 0xc0, 1, dac_vol_tlv),
+	SOC_SINGLE("DAC Soft Ramp Switch", ES8316_DAC_SET1, 4, 1, 1),
+	SOC_SINGLE("DAC Soft Ramp Rate", ES8316_DAC_SET1, 2, 4, 0),
+	SOC_SINGLE("DAC Notch Filter Switch", ES8316_DAC_SET2, 6, 1, 0),
+	SOC_SINGLE("DAC Double Fs Switch", ES8316_DAC_SET2, 7, 1, 0),
+	SOC_SINGLE("DAC Stereo Enhancement", ES8316_DAC_SET3, 0, 7, 0),
+	SOC_SINGLE("DAC Mono Mix Switch", ES8316_DAC_SET3, 3, 1, 0),
+
+	SOC_ENUM("Capture Polarity", adcpol),
+	SOC_SINGLE("Mic Boost Switch", ES8316_ADC_D2SEPGA, 0, 1, 0),
+	SOC_SINGLE_TLV("ADC Capture Volume", ES8316_ADC_VOLUME,
+		       0, 0xc0, 1, adc_vol_tlv),
+	SOC_SINGLE_TLV("ADC PGA Gain Volume", ES8316_ADC_PGAGAIN,
+		       4, 10, 0, adc_pga_gain_tlv),
+	SOC_SINGLE("ADC Soft Ramp Switch", ES8316_ADC_MUTE, 4, 1, 0),
+	SOC_SINGLE("ADC Double Fs Switch", ES8316_ADC_DMIC, 4, 1, 0),
+
+	SOC_SINGLE("ALC Capture Switch", ES8316_ADC_ALC1, 6, 1, 0),
+	SOC_SINGLE_TLV("ALC Capture Max Volume", ES8316_ADC_ALC1, 0, 28, 0,
+		       alc_max_gain_tlv),
+	SOC_SINGLE_TLV("ALC Capture Min Volume", ES8316_ADC_ALC2, 0, 28, 0,
+		       alc_min_gain_tlv),
+	SOC_SINGLE_TLV("ALC Capture Target Volume", ES8316_ADC_ALC3, 4, 10, 0,
+		       alc_target_tlv),
+	SOC_SINGLE("ALC Capture Hold Time", ES8316_ADC_ALC3, 0, 10, 0),
+	SOC_SINGLE("ALC Capture Decay Time", ES8316_ADC_ALC4, 4, 10, 0),
+	SOC_SINGLE("ALC Capture Attack Time", ES8316_ADC_ALC4, 0, 10, 0),
+	SOC_SINGLE("ALC Capture Noise Gate Switch", ES8316_ADC_ALC_NG,
+		   5, 1, 0),
+	SOC_SINGLE("ALC Capture Noise Gate Threshold", ES8316_ADC_ALC_NG,
+		   0, 31, 0),
+	SOC_ENUM("ALC Capture Noise Gate Type", ng_type),
 };
 
-static int sof_es8336_hw_params(struct snd_pcm_substream *substream,
-				struct snd_pcm_hw_params *params)
-{
-	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
-	struct snd_soc_dai *codec_dai = asoc_rtd_to_codec(rtd, 0);
-	const int sysclk = 19200000;
-	int ret;
+/* Analog Input Mux */
+static const char * const es8316_analog_in_txt[] = {
+		"lin1-rin1",
+		"lin2-rin2",
+		"lin1-rin1 with 20db Boost",
+		"lin2-rin2 with 20db Boost"
+};
+static const unsigned int es8316_analog_in_values[] = { 0, 1, 2, 3 };
+static const struct soc_enum es8316_analog_input_enum =
+	SOC_VALUE_ENUM_SINGLE(ES8316_ADC_PDN_LINSEL, 4, 3,
+			      ARRAY_SIZE(es8316_analog_in_txt),
+			      es8316_analog_in_txt,
+			      es8316_analog_in_values);
+static const struct snd_kcontrol_new es8316_analog_in_mux_controls =
+	SOC_DAPM_ENUM("Route", es8316_analog_input_enum);
 
-	ret = snd_soc_dai_set_sysclk(codec_dai, 1, sysclk, SND_SOC_CLOCK_OUT);
-	if (ret < 0) {
-		dev_err(rtd->dev, "%s, Failed to set ES8336 SYSCLK: %d\n",
-			__func__, ret);
-		return ret;
+static const char * const es8316_dmic_txt[] = {
+		"dmic disable",
+		"dmic data at high level",
+		"dmic data at low level",
+};
+static const unsigned int es8316_dmic_values[] = { 0, 1, 2 };
+static const struct soc_enum es8316_dmic_src_enum =
+	SOC_VALUE_ENUM_SINGLE(ES8316_ADC_DMIC, 0, 3,
+			      ARRAY_SIZE(es8316_dmic_txt),
+			      es8316_dmic_txt,
+			      es8316_dmic_values);
+static const struct snd_kcontrol_new es8316_dmic_src_controls =
+	SOC_DAPM_ENUM("Route", es8316_dmic_src_enum);
+
+/* hp mixer mux */
+static const char * const es8316_hpmux_texts[] = {
+	"lin1-rin1",
+	"lin2-rin2",
+	"lin-rin with Boost",
+	"lin-rin with Boost and PGA"
+};
+
+static SOC_ENUM_SINGLE_DECL(es8316_left_hpmux_enum, ES8316_HPMIX_SEL,
+	4, es8316_hpmux_texts);
+
+static const struct snd_kcontrol_new es8316_left_hpmux_controls =
+	SOC_DAPM_ENUM("Route", es8316_left_hpmux_enum);
+
+static SOC_ENUM_SINGLE_DECL(es8316_right_hpmux_enum, ES8316_HPMIX_SEL,
+	0, es8316_hpmux_texts);
+
+static const struct snd_kcontrol_new es8316_right_hpmux_controls =
+	SOC_DAPM_ENUM("Route", es8316_right_hpmux_enum);
+
+/* headphone Output Mixer */
+static const struct snd_kcontrol_new es8316_out_left_mix[] = {
+	SOC_DAPM_SINGLE("LLIN Switch", ES8316_HPMIX_SWITCH, 6, 1, 0),
+	SOC_DAPM_SINGLE("Left DAC Switch", ES8316_HPMIX_SWITCH, 7, 1, 0),
+};
+static const struct snd_kcontrol_new es8316_out_right_mix[] = {
+	SOC_DAPM_SINGLE("RLIN Switch", ES8316_HPMIX_SWITCH, 2, 1, 0),
+	SOC_DAPM_SINGLE("Right DAC Switch", ES8316_HPMIX_SWITCH, 3, 1, 0),
+};
+
+/* DAC data source mux */
+static const char * const es8316_dacsrc_texts[] = {
+	"LDATA TO LDAC, RDATA TO RDAC",
+	"LDATA TO LDAC, LDATA TO RDAC",
+	"RDATA TO LDAC, RDATA TO RDAC",
+	"RDATA TO LDAC, LDATA TO RDAC",
+};
+
+static SOC_ENUM_SINGLE_DECL(es8316_dacsrc_mux_enum, ES8316_DAC_SET1,
+	6, es8316_dacsrc_texts);
+
+static const struct snd_kcontrol_new es8316_dacsrc_mux_controls =
+	SOC_DAPM_ENUM("Route", es8316_dacsrc_mux_enum);
+
+static const struct snd_soc_dapm_widget es8316_dapm_widgets[] = {
+	SND_SOC_DAPM_SUPPLY("Bias", ES8316_SYS_PDN, 3, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("Analog power", ES8316_SYS_PDN, 4, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("Mic Bias", ES8316_SYS_PDN, 5, 1, NULL, 0),
+
+	SND_SOC_DAPM_INPUT("DMIC"),
+	SND_SOC_DAPM_INPUT("MIC1"),
+	SND_SOC_DAPM_INPUT("MIC2"),
+
+	/* Input Mux */
+	SND_SOC_DAPM_MUX("Differential Mux", SND_SOC_NOPM, 0, 0,
+			 &es8316_analog_in_mux_controls),
+
+	SND_SOC_DAPM_SUPPLY("ADC Vref", ES8316_SYS_PDN, 1, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("ADC bias", ES8316_SYS_PDN, 2, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("ADC Clock", ES8316_CLKMGR_CLKSW, 3, 0, NULL, 0),
+	SND_SOC_DAPM_PGA("Line input PGA", ES8316_ADC_PDN_LINSEL,
+			 7, 1, NULL, 0),
+	SND_SOC_DAPM_ADC("Mono ADC", NULL, ES8316_ADC_PDN_LINSEL, 6, 1),
+	SND_SOC_DAPM_MUX("Digital Mic Mux", SND_SOC_NOPM, 0, 0,
+			 &es8316_dmic_src_controls),
+
+	/* Digital Interface */
+	SND_SOC_DAPM_AIF_OUT("I2S OUT", "I2S1 Capture",  1,
+			     ES8316_SERDATA_ADC, 6, 1),
+	SND_SOC_DAPM_AIF_IN("I2S IN", "I2S1 Playback", 0,
+			    SND_SOC_NOPM, 0, 0),
+
+	SND_SOC_DAPM_MUX("DAC Source Mux", SND_SOC_NOPM, 0, 0,
+			 &es8316_dacsrc_mux_controls),
+
+	SND_SOC_DAPM_SUPPLY("DAC Vref", ES8316_SYS_PDN, 0, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC Clock", ES8316_CLKMGR_CLKSW, 2, 0, NULL, 0),
+	SND_SOC_DAPM_DAC("Right DAC", NULL, ES8316_DAC_PDN, 0, 1),
+	SND_SOC_DAPM_DAC("Left DAC", NULL, ES8316_DAC_PDN, 4, 1),
+
+	/* Headphone Output Side */
+	SND_SOC_DAPM_MUX("Left Headphone Mux", SND_SOC_NOPM, 0, 0,
+			 &es8316_left_hpmux_controls),
+	SND_SOC_DAPM_MUX("Right Headphone Mux", SND_SOC_NOPM, 0, 0,
+			 &es8316_right_hpmux_controls),
+	SND_SOC_DAPM_MIXER("Left Headphone Mixer", ES8316_HPMIX_PDN,
+			   5, 1, &es8316_out_left_mix[0],
+			   ARRAY_SIZE(es8316_out_left_mix)),
+	SND_SOC_DAPM_MIXER("Right Headphone Mixer", ES8316_HPMIX_PDN,
+			   1, 1, &es8316_out_right_mix[0],
+			   ARRAY_SIZE(es8316_out_right_mix)),
+	SND_SOC_DAPM_PGA("Left Headphone Mixer Out", ES8316_HPMIX_PDN,
+			 4, 1, NULL, 0),
+	SND_SOC_DAPM_PGA("Right Headphone Mixer Out", ES8316_HPMIX_PDN,
+			 0, 1, NULL, 0),
+
+	SND_SOC_DAPM_OUT_DRV("Left Headphone Charge Pump", ES8316_CPHP_OUTEN,
+			     6, 0, NULL, 0),
+	SND_SOC_DAPM_OUT_DRV("Right Headphone Charge Pump", ES8316_CPHP_OUTEN,
+			     2, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("Headphone Charge Pump", ES8316_CPHP_PDN2,
+			    5, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("Headphone Charge Pump Clock", ES8316_CLKMGR_CLKSW,
+			    4, 0, NULL, 0),
+
+	SND_SOC_DAPM_OUT_DRV("Left Headphone Driver", ES8316_CPHP_OUTEN,
+			     5, 0, NULL, 0),
+	SND_SOC_DAPM_OUT_DRV("Right Headphone Driver", ES8316_CPHP_OUTEN,
+			     1, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("Headphone Out", ES8316_CPHP_PDN1, 2, 1, NULL, 0),
+
+	/* pdn_Lical and pdn_Rical bits are documented as Reserved, but must
+	 * be explicitly unset in order to enable HP output
+	 */
+	SND_SOC_DAPM_SUPPLY("Left Headphone ical", ES8316_CPHP_ICAL_VOL,
+			    7, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("Right Headphone ical", ES8316_CPHP_ICAL_VOL,
+			    3, 1, NULL, 0),
+
+	SND_SOC_DAPM_OUTPUT("HPOL"),
+	SND_SOC_DAPM_OUTPUT("HPOR"),
+};
+
+static const struct snd_soc_dapm_route es8316_dapm_routes[] = {
+	/* Recording */
+	{"MIC1", NULL, "Mic Bias"},
+	{"MIC2", NULL, "Mic Bias"},
+	{"MIC1", NULL, "Bias"},
+	{"MIC2", NULL, "Bias"},
+	{"MIC1", NULL, "Analog power"},
+	{"MIC2", NULL, "Analog power"},
+
+	{"Differential Mux", "lin1-rin1", "MIC1"},
+	{"Differential Mux", "lin2-rin2", "MIC2"},
+	{"Line input PGA", NULL, "Differential Mux"},
+
+	{"Mono ADC", NULL, "ADC Clock"},
+	{"Mono ADC", NULL, "ADC Vref"},
+	{"Mono ADC", NULL, "ADC bias"},
+	{"Mono ADC", NULL, "Line input PGA"},
+
+	/* It's not clear why, but to avoid recording only silence,
+	 * the DAC clock must be running for the ADC to work.
+	 */
+	{"Mono ADC", NULL, "DAC Clock"},
+
+	{"Digital Mic Mux", "dmic disable", "Mono ADC"},
+
+	{"I2S OUT", NULL, "Digital Mic Mux"},
+
+	/* Playback */
+	{"DAC Source Mux", "LDATA TO LDAC, RDATA TO RDAC", "I2S IN"},
+
+	{"Left DAC", NULL, "DAC Clock"},
+	{"Right DAC", NULL, "DAC Clock"},
+
+	{"Left DAC", NULL, "DAC Vref"},
+	{"Right DAC", NULL, "DAC Vref"},
+
+	{"Left DAC", NULL, "DAC Source Mux"},
+	{"Right DAC", NULL, "DAC Source Mux"},
+
+	{"Left Headphone Mux", "lin-rin with Boost and PGA", "Line input PGA"},
+	{"Right Headphone Mux", "lin-rin with Boost and PGA", "Line input PGA"},
+
+	{"Left Headphone Mixer", "LLIN Switch", "Left Headphone Mux"},
+	{"Left Headphone Mixer", "Left DAC Switch", "Left DAC"},
+
+	{"Right Headphone Mixer", "RLIN Switch", "Right Headphone Mux"},
+	{"Right Headphone Mixer", "Right DAC Switch", "Right DAC"},
+
+	{"Left Headphone Mixer Out", NULL, "Left Headphone Mixer"},
+	{"Right Headphone Mixer Out", NULL, "Right Headphone Mixer"},
+
+	{"Left Headphone Charge Pump", NULL, "Left Headphone Mixer Out"},
+	{"Right Headphone Charge Pump", NULL, "Right Headphone Mixer Out"},
+
+	{"Left Headphone Charge Pump", NULL, "Headphone Charge Pump"},
+	{"Right Headphone Charge Pump", NULL, "Headphone Charge Pump"},
+
+	{"Left Headphone Charge Pump", NULL, "Headphone Charge Pump Clock"},
+	{"Right Headphone Charge Pump", NULL, "Headphone Charge Pump Clock"},
+
+	{"Left Headphone Driver", NULL, "Left Headphone Charge Pump"},
+	{"Right Headphone Driver", NULL, "Right Headphone Charge Pump"},
+
+	{"HPOL", NULL, "Left Headphone Driver"},
+	{"HPOR", NULL, "Right Headphone Driver"},
+
+	{"HPOL", NULL, "Left Headphone ical"},
+	{"HPOR", NULL, "Right Headphone ical"},
+
+	{"Headphone Out", NULL, "Bias"},
+	{"Headphone Out", NULL, "Analog power"},
+	{"HPOL", NULL, "Headphone Out"},
+	{"HPOR", NULL, "Headphone Out"},
+};
+
+static int es8316_set_dai_sysclk(struct snd_soc_dai *codec_dai,
+				 int clk_id, unsigned int freq, int dir)
+{
+	struct snd_soc_component *component = codec_dai->component;
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+	int i, ret;
+	int count = 0;
+
+	es8316->sysclk = freq;
+
+	if (freq == 0) {
+		es8316->sysclk_constraints.list = NULL;
+		es8316->sysclk_constraints.count = 0;
+
+		return 0;
 	}
+
+	ret = clk_set_rate(es8316->mclk, freq);
+	if (ret)
+		return ret;
+
+	/* Limit supported sample rates to ones that can be autodetected
+	 * by the codec running in slave mode.
+	 */
+	for (i = 0; i < NR_SUPPORTED_MCLK_LRCK_RATIOS; i++) {
+		const unsigned int ratio = supported_mclk_lrck_ratios[i];
+
+		if (freq % ratio == 0)
+			es8316->allowed_rates[count++] = freq / ratio;
+	}
+
+	es8316->sysclk_constraints.list = es8316->allowed_rates;
+	es8316->sysclk_constraints.count = count;
 
 	return 0;
 }
 
-/* machine stream operations */
-static struct snd_soc_ops sof_es8336_ops = {
-	.hw_params = sof_es8336_hw_params,
-};
-
-static struct snd_soc_dai_link_component platform_component[] = {
-	{
-		/* name might be overridden during probe */
-		.name = "0000:00:1f.3"
-	}
-};
-
-SND_SOC_DAILINK_DEF(es8336_codec,
-	DAILINK_COMP_ARRAY(COMP_CODEC("i2c-ESSX8336:00", "ES8316 HiFi")));
-
-static struct snd_soc_dai_link_component dmic_component[] = {
-	{
-		.name = "dmic-codec",
-		.dai_name = "dmic-hifi",
-	}
-};
-
-static int sof_es8336_late_probe(struct snd_soc_card *card)
+static int es8316_set_dai_fmt(struct snd_soc_dai *codec_dai,
+			      unsigned int fmt)
 {
-	struct sof_es8336_private *priv = snd_soc_card_get_drvdata(card);
-	struct sof_hdmi_pcm *pcm;
+	struct snd_soc_component *component = codec_dai->component;
+	u8 serdata1 = 0;
+	u8 serdata2 = 0;
+	u8 clksw;
+	u8 mask;
 
-	if (list_empty(&priv->hdmi_pcm_list))
-		return -ENOENT;
+	if ((fmt & SND_SOC_DAIFMT_MASTER_MASK) == SND_SOC_DAIFMT_CBP_CFP)
+		serdata1 |= ES8316_SERDATA1_MASTER;
 
-	pcm = list_first_entry(&priv->hdmi_pcm_list, struct sof_hdmi_pcm, head);
+	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S) {
+		dev_err(component->dev, "Codec driver only supports I2S format\n");
+		return -EINVAL;
+	}
 
-	return hda_dsp_hdmi_build_controls(card, pcm->codec_dai->component);
+	/* Clock inversion */
+	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
+	case SND_SOC_DAIFMT_NB_NF:
+		break;
+	case SND_SOC_DAIFMT_IB_IF:
+		serdata1 |= ES8316_SERDATA1_BCLK_INV;
+		serdata2 |= ES8316_SERDATA2_ADCLRP;
+		break;
+	case SND_SOC_DAIFMT_IB_NF:
+		serdata1 |= ES8316_SERDATA1_BCLK_INV;
+		break;
+	case SND_SOC_DAIFMT_NB_IF:
+		serdata2 |= ES8316_SERDATA2_ADCLRP;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	mask = ES8316_SERDATA1_MASTER | ES8316_SERDATA1_BCLK_INV;
+	snd_soc_component_update_bits(component, ES8316_SERDATA1, mask, serdata1);
+
+	mask = ES8316_SERDATA2_FMT_MASK | ES8316_SERDATA2_ADCLRP;
+	snd_soc_component_update_bits(component, ES8316_SERDATA_ADC, mask, serdata2);
+	snd_soc_component_update_bits(component, ES8316_SERDATA_DAC, mask, serdata2);
+
+	/* Enable BCLK and MCLK inputs in slave mode */
+	clksw = ES8316_CLKMGR_CLKSW_MCLK_ON | ES8316_CLKMGR_CLKSW_BCLK_ON;
+	snd_soc_component_update_bits(component, ES8316_CLKMGR_CLKSW, clksw, clksw);
+
+	return 0;
 }
 
-/* SoC card */
-static struct snd_soc_card sof_es8336_card = {
-	.name = "essx8336", /* sof- prefix added automatically */
-	.owner = THIS_MODULE,
-	.dapm_widgets = sof_es8316_widgets,
-	.num_dapm_widgets = ARRAY_SIZE(sof_es8316_widgets),
-	.dapm_routes = sof_es8316_audio_map,
-	.num_dapm_routes = ARRAY_SIZE(sof_es8316_audio_map),
-	.controls = sof_es8316_controls,
-	.num_controls = ARRAY_SIZE(sof_es8316_controls),
-	.fully_routed = true,
-	.late_probe = sof_es8336_late_probe,
-	.num_links = 1,
-};
-
-static struct snd_soc_dai_link *sof_card_dai_links_create(struct device *dev,
-							  int ssp_codec,
-							  int dmic_be_num,
-							  int hdmi_num)
+static int es8316_pcm_startup(struct snd_pcm_substream *substream,
+			      struct snd_soc_dai *dai)
 {
-	struct snd_soc_dai_link_component *cpus;
-	struct snd_soc_dai_link *links;
-	struct snd_soc_dai_link_component *idisp_components;
-	int hdmi_id_offset = 0;
-	int id = 0;
+	struct snd_soc_component *component = dai->component;
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+
+	if (es8316->sysclk_constraints.list)
+		snd_pcm_hw_constraint_list(substream->runtime, 0,
+					   SNDRV_PCM_HW_PARAM_RATE,
+					   &es8316->sysclk_constraints);
+
+	return 0;
+}
+
+static int es8316_pcm_hw_params(struct snd_pcm_substream *substream,
+				struct snd_pcm_hw_params *params,
+				struct snd_soc_dai *dai)
+{
+	struct snd_soc_component *component = dai->component;
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+	u8 wordlen = 0;
+	u8 bclk_divider;
+	u16 lrck_divider;
 	int i;
 
-	links = devm_kcalloc(dev, sof_es8336_card.num_links,
-			     sizeof(struct snd_soc_dai_link), GFP_KERNEL);
-	cpus = devm_kcalloc(dev, sof_es8336_card.num_links,
-			    sizeof(struct snd_soc_dai_link_component), GFP_KERNEL);
-	if (!links || !cpus)
-		goto devm_err;
+	/* Validate supported sample rates that are autodetected from MCLK */
+	for (i = 0; i < NR_SUPPORTED_MCLK_LRCK_RATIOS; i++) {
+		const unsigned int ratio = supported_mclk_lrck_ratios[i];
 
-	/* codec SSP */
-	links[id].name = devm_kasprintf(dev, GFP_KERNEL,
-					"SSP%d-Codec", ssp_codec);
-	if (!links[id].name)
-		goto devm_err;
-
-	links[id].id = id;
-	links[id].codecs = es8336_codec;
-	links[id].num_codecs = ARRAY_SIZE(es8336_codec);
-	links[id].platforms = platform_component;
-	links[id].num_platforms = ARRAY_SIZE(platform_component);
-	links[id].init = sof_es8316_init;
-	links[id].exit = sof_es8316_exit;
-	links[id].ops = &sof_es8336_ops;
-	links[id].nonatomic = true;
-	links[id].dpcm_playback = 1;
-	links[id].dpcm_capture = 1;
-	links[id].no_pcm = 1;
-	links[id].cpus = &cpus[id];
-	links[id].num_cpus = 1;
-
-	links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
-						  "SSP%d Pin",
-						  ssp_codec);
-	if (!links[id].cpus->dai_name)
-		goto devm_err;
-
-	id++;
-
-	/* dmic */
-	if (dmic_be_num > 0) {
-		/* at least we have dmic01 */
-		links[id].name = "dmic01";
-		links[id].cpus = &cpus[id];
-		links[id].cpus->dai_name = "DMIC01 Pin";
-		links[id].init = dmic_init;
-		if (dmic_be_num > 1) {
-			/* set up 2 BE links at most */
-			links[id + 1].name = "dmic16k";
-			links[id + 1].cpus = &cpus[id + 1];
-			links[id + 1].cpus->dai_name = "DMIC16k Pin";
-			dmic_be_num = 2;
-		}
-	} else {
-		/* HDMI dai link starts at 3 according to current topology settings */
-		hdmi_id_offset = 2;
+		if (es8316->sysclk % ratio != 0)
+			continue;
+		if (es8316->sysclk / ratio == params_rate(params))
+			break;
+	}
+	if (i == NR_SUPPORTED_MCLK_LRCK_RATIOS)
+		return -EINVAL;
+	lrck_divider = es8316->sysclk / params_rate(params);
+	bclk_divider = lrck_divider / 4;
+	switch (params_format(params)) {
+	case SNDRV_PCM_FORMAT_S16_LE:
+		wordlen = ES8316_SERDATA2_LEN_16;
+		bclk_divider /= 16;
+		break;
+	case SNDRV_PCM_FORMAT_S20_3LE:
+		wordlen = ES8316_SERDATA2_LEN_20;
+		bclk_divider /= 20;
+		break;
+	case SNDRV_PCM_FORMAT_S24_LE:
+		wordlen = ES8316_SERDATA2_LEN_24;
+		bclk_divider /= 24;
+		break;
+	case SNDRV_PCM_FORMAT_S32_LE:
+		wordlen = ES8316_SERDATA2_LEN_32;
+		bclk_divider /= 32;
+		break;
+	default:
+		return -EINVAL;
 	}
 
-	for (i = 0; i < dmic_be_num; i++) {
-		links[id].id = id;
-		links[id].num_cpus = 1;
-		links[id].codecs = dmic_component;
-		links[id].num_codecs = ARRAY_SIZE(dmic_component);
-		links[id].platforms = platform_component;
-		links[id].num_platforms = ARRAY_SIZE(platform_component);
-		links[id].ignore_suspend = 1;
-		links[id].dpcm_capture = 1;
-		links[id].no_pcm = 1;
-
-		id++;
-	}
-
-	/* HDMI */
-	if (hdmi_num > 0) {
-		idisp_components = devm_kzalloc(dev,
-						sizeof(struct snd_soc_dai_link_component) *
-						hdmi_num, GFP_KERNEL);
-		if (!idisp_components)
-			goto devm_err;
-	}
-
-	for (i = 1; i <= hdmi_num; i++) {
-		links[id].name = devm_kasprintf(dev, GFP_KERNEL,
-						"iDisp%d", i);
-		if (!links[id].name)
-			goto devm_err;
-
-		links[id].id = id + hdmi_id_offset;
-		links[id].cpus = &cpus[id];
-		links[id].num_cpus = 1;
-		links[id].cpus->dai_name = devm_kasprintf(dev, GFP_KERNEL,
-							  "iDisp%d Pin", i);
-		if (!links[id].cpus->dai_name)
-			goto devm_err;
-
-		idisp_components[i - 1].name = "ehdaudio0D2";
-		idisp_components[i - 1].dai_name = devm_kasprintf(dev,
-								  GFP_KERNEL,
-								  "intel-hdmi-hifi%d",
-								  i);
-		if (!idisp_components[i - 1].dai_name)
-			goto devm_err;
-
-		links[id].codecs = &idisp_components[i - 1];
-		links[id].num_codecs = 1;
-		links[id].platforms = platform_component;
-		links[id].num_platforms = ARRAY_SIZE(platform_component);
-		links[id].init = sof_hdmi_init;
-		links[id].dpcm_playback = 1;
-		links[id].no_pcm = 1;
-
-		id++;
-	}
-
-	return links;
-
-devm_err:
-	return NULL;
+	snd_soc_component_update_bits(component, ES8316_SERDATA_DAC,
+			    ES8316_SERDATA2_LEN_MASK, wordlen);
+	snd_soc_component_update_bits(component, ES8316_SERDATA_ADC,
+			    ES8316_SERDATA2_LEN_MASK, wordlen);
+	snd_soc_component_update_bits(component, ES8316_SERDATA1, 0x1f, bclk_divider);
+	snd_soc_component_update_bits(component, ES8316_CLKMGR_ADCDIV1, 0x0f, lrck_divider >> 8);
+	snd_soc_component_update_bits(component, ES8316_CLKMGR_ADCDIV2, 0xff, lrck_divider & 0xff);
+	snd_soc_component_update_bits(component, ES8316_CLKMGR_DACDIV1, 0x0f, lrck_divider >> 8);
+	snd_soc_component_update_bits(component, ES8316_CLKMGR_DACDIV2, 0xff, lrck_divider & 0xff);
+	return 0;
 }
 
-static char soc_components[30];
-
- /* i2c-<HID>:00 with HID being 8 chars */
-static char codec_name[SND_ACPI_I2C_ID_LEN];
-
-static int sof_es8336_probe(struct platform_device *pdev)
+static int es8316_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
-	struct device *dev = &pdev->dev;
-	struct snd_soc_card *card;
-	struct snd_soc_acpi_mach *mach = pdev->dev.platform_data;
-	struct property_entry props[MAX_NO_PROPS] = {};
-	struct sof_es8336_private *priv;
-	struct fwnode_handle *fwnode;
-	struct acpi_device *adev;
-	struct snd_soc_dai_link *dai_links;
-	struct device *codec_dev;
-	unsigned int cnt = 0;
-	int dmic_be_num = 0;
-	int hdmi_num = 3;
+	snd_soc_component_update_bits(dai->component, ES8316_DAC_SET1, 0x20,
+			    mute ? 0x20 : 0);
+	return 0;
+}
+
+#define ES8316_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
+			SNDRV_PCM_FMTBIT_S24_LE)
+
+static const struct snd_soc_dai_ops es8316_ops = {
+	.startup = es8316_pcm_startup,
+	.hw_params = es8316_pcm_hw_params,
+	.set_fmt = es8316_set_dai_fmt,
+	.set_sysclk = es8316_set_dai_sysclk,
+	.mute_stream = es8316_mute,
+	.no_capture_mute = 1,
+};
+
+static struct snd_soc_dai_driver es8316_dai = {
+	.name = "ES8316 HiFi",
+	.playback = {
+		.stream_name = "Playback",
+		.channels_min = 1,
+		.channels_max = 2,
+		.rates = SNDRV_PCM_RATE_8000_48000,
+		.formats = ES8316_FORMATS,
+	},
+	.capture = {
+		.stream_name = "Capture",
+		.channels_min = 1,
+		.channels_max = 2,
+		.rates = SNDRV_PCM_RATE_8000_48000,
+		.formats = ES8316_FORMATS,
+	},
+	.ops = &es8316_ops,
+	.symmetric_rate = 1,
+};
+
+static void es8316_enable_micbias_for_mic_gnd_short_detect(
+	struct snd_soc_component *component)
+{
+	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
+
+	snd_soc_dapm_mutex_lock(dapm);
+	snd_soc_dapm_force_enable_pin_unlocked(dapm, "Bias");
+	snd_soc_dapm_force_enable_pin_unlocked(dapm, "Analog power");
+	snd_soc_dapm_force_enable_pin_unlocked(dapm, "Mic Bias");
+	snd_soc_dapm_sync_unlocked(dapm);
+	snd_soc_dapm_mutex_unlock(dapm);
+
+	msleep(20);
+}
+
+static void es8316_disable_micbias_for_mic_gnd_short_detect(
+	struct snd_soc_component *component)
+{
+	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
+
+	snd_soc_dapm_mutex_lock(dapm);
+	snd_soc_dapm_disable_pin_unlocked(dapm, "Mic Bias");
+	snd_soc_dapm_disable_pin_unlocked(dapm, "Analog power");
+	snd_soc_dapm_disable_pin_unlocked(dapm, "Bias");
+	snd_soc_dapm_sync_unlocked(dapm);
+	snd_soc_dapm_mutex_unlock(dapm);
+}
+
+static irqreturn_t es8316_irq(int irq, void *data)
+{
+	struct es8316_priv *es8316 = data;
+	struct snd_soc_component *comp = es8316->component;
+	unsigned int flags;
+
+	mutex_lock(&es8316->lock);
+
+	regmap_read(es8316->regmap, ES8316_GPIO_FLAG, &flags);
+	if (flags == 0x00)
+		goto out; /* Powered-down / reset */
+
+	/* Catch spurious IRQ before set_jack is called */
+	if (!es8316->jack)
+		goto out;
+
+	if (es8316->jd_inverted)
+		flags ^= ES8316_GPIO_FLAG_HP_NOT_INSERTED;
+
+	dev_dbg(comp->dev, "gpio flags %#04x\n", flags);
+	if (flags & ES8316_GPIO_FLAG_HP_NOT_INSERTED) {
+		/* Jack removed, or spurious IRQ? */
+		if (es8316->jack->status & SND_JACK_MICROPHONE)
+			es8316_disable_micbias_for_mic_gnd_short_detect(comp);
+
+		if (es8316->jack->status & SND_JACK_HEADPHONE) {
+			snd_soc_jack_report(es8316->jack, 0,
+					    SND_JACK_HEADSET | SND_JACK_BTN_0);
+			dev_dbg(comp->dev, "jack unplugged\n");
+		}
+	} else if (!(es8316->jack->status & SND_JACK_HEADPHONE)) {
+		/* Jack inserted, determine type */
+		es8316_enable_micbias_for_mic_gnd_short_detect(comp);
+		regmap_read(es8316->regmap, ES8316_GPIO_FLAG, &flags);
+		if (es8316->jd_inverted)
+			flags ^= ES8316_GPIO_FLAG_HP_NOT_INSERTED;
+		dev_dbg(comp->dev, "gpio flags %#04x\n", flags);
+		if (flags & ES8316_GPIO_FLAG_HP_NOT_INSERTED) {
+			/* Jack unplugged underneath us */
+			es8316_disable_micbias_for_mic_gnd_short_detect(comp);
+		} else if (flags & ES8316_GPIO_FLAG_GM_NOT_SHORTED) {
+			/* Open, headset */
+			snd_soc_jack_report(es8316->jack,
+					    SND_JACK_HEADSET,
+					    SND_JACK_HEADSET);
+			/* Keep mic-gnd-short detection on for button press */
+		} else {
+			/* Shorted, headphones */
+			snd_soc_jack_report(es8316->jack,
+					    SND_JACK_HEADPHONE,
+					    SND_JACK_HEADSET);
+			/* No longer need mic-gnd-short detection */
+			es8316_disable_micbias_for_mic_gnd_short_detect(comp);
+		}
+	} else if (es8316->jack->status & SND_JACK_MICROPHONE) {
+		/* Interrupt while jack inserted, report button state */
+		if (flags & ES8316_GPIO_FLAG_GM_NOT_SHORTED) {
+			/* Open, button release */
+			snd_soc_jack_report(es8316->jack, 0, SND_JACK_BTN_0);
+		} else {
+			/* Short, button press */
+			snd_soc_jack_report(es8316->jack,
+					    SND_JACK_BTN_0,
+					    SND_JACK_BTN_0);
+		}
+	}
+
+out:
+	mutex_unlock(&es8316->lock);
+	return IRQ_HANDLED;
+}
+
+static void es8316_enable_jack_detect(struct snd_soc_component *component,
+				      struct snd_soc_jack *jack)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+
+	/*
+	 * Init es8316->jd_inverted here and not in the probe, as we cannot
+	 * guarantee that the bytchr-es8316 driver, which might set this
+	 * property, will probe before us.
+	 */
+	es8316->jd_inverted = device_property_read_bool(component->dev,
+							"everest,jack-detect-inverted");
+
+	mutex_lock(&es8316->lock);
+
+	es8316->jack = jack;
+
+	if (es8316->jack->status & SND_JACK_MICROPHONE)
+		es8316_enable_micbias_for_mic_gnd_short_detect(component);
+
+	snd_soc_component_update_bits(component, ES8316_GPIO_DEBOUNCE,
+				      ES8316_GPIO_ENABLE_INTERRUPT,
+				      ES8316_GPIO_ENABLE_INTERRUPT);
+
+	mutex_unlock(&es8316->lock);
+
+	/* Enable irq and sync initial jack state */
+	enable_irq(es8316->irq);
+	es8316_irq(es8316->irq, es8316);
+}
+
+static void es8316_disable_jack_detect(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+
+	if (!es8316->jack)
+		return; /* Already disabled (or never enabled) */
+
+	disable_irq(es8316->irq);
+
+	mutex_lock(&es8316->lock);
+
+	snd_soc_component_update_bits(component, ES8316_GPIO_DEBOUNCE,
+				      ES8316_GPIO_ENABLE_INTERRUPT, 0);
+
+	if (es8316->jack->status & SND_JACK_MICROPHONE) {
+		es8316_disable_micbias_for_mic_gnd_short_detect(component);
+		snd_soc_jack_report(es8316->jack, 0, SND_JACK_BTN_0);
+	}
+
+	es8316->jack = NULL;
+
+	mutex_unlock(&es8316->lock);
+}
+
+static int es8316_set_jack(struct snd_soc_component *component,
+			   struct snd_soc_jack *jack, void *data)
+{
+	if (jack)
+		es8316_enable_jack_detect(component, jack);
+	else
+		es8316_disable_jack_detect(component);
+
+	return 0;
+}
+
+static int es8316_probe(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
 	int ret;
 
-	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
+	es8316->component = component;
 
-	card = &sof_es8336_card;
-	card->dev = dev;
-
-	/* check GPIO DMI quirks */
-	dmi_check_system(sof_es8336_quirk_table);
-
-	if (!mach->mach_params.i2s_link_mask) {
-		dev_warn(dev, "No I2S link information provided, using SSP0. This may need to be modified with the quirk module parameter\n");
-	} else {
-		/*
-		 * Set configuration based on platform NHLT.
-		 * In this machine driver, we can only support one SSP for the
-		 * ES8336 link, the else-if below are intentional.
-		 * In some cases multiple SSPs can be reported by NHLT, starting MSB-first
-		 * seems to pick the right connection.
-		 */
-		unsigned long ssp = 0;
-
-		if (mach->mach_params.i2s_link_mask & BIT(2))
-			ssp = SOF_ES8336_SSP_CODEC(2);
-		else if (mach->mach_params.i2s_link_mask & BIT(1))
-			ssp = SOF_ES8336_SSP_CODEC(1);
-		else  if (mach->mach_params.i2s_link_mask & BIT(0))
-			ssp = SOF_ES8336_SSP_CODEC(0);
-
-		quirk |= ssp;
+	es8316->mclk = devm_clk_get_optional(component->dev, "mclk");
+	if (IS_ERR(es8316->mclk)) {
+		dev_err(component->dev, "unable to get mclk\n");
+		return PTR_ERR(es8316->mclk);
 	}
+	if (!es8316->mclk)
+		dev_warn(component->dev, "assuming static mclk\n");
 
-	if (mach->mach_params.dmic_num)
-		quirk |= SOF_ES8336_ENABLE_DMIC;
-
-	if (quirk_override != -1) {
-		dev_info(dev, "Overriding quirk 0x%lx => 0x%x\n",
-			 quirk, quirk_override);
-		quirk = quirk_override;
-	}
-	log_quirks(dev);
-
-	if (quirk & SOF_ES8336_ENABLE_DMIC)
-		dmic_be_num = 2;
-
-	sof_es8336_card.num_links += dmic_be_num + hdmi_num;
-	dai_links = sof_card_dai_links_create(dev,
-					      SOF_ES8336_SSP_CODEC(quirk),
-					      dmic_be_num, hdmi_num);
-	if (!dai_links)
-		return -ENOMEM;
-
-	sof_es8336_card.dai_link = dai_links;
-
-	/* fixup codec name based on HID */
-	adev = acpi_dev_get_first_match_dev(mach->id, NULL, -1);
-	if (adev) {
-		snprintf(codec_name, sizeof(codec_name),
-			 "i2c-%s", acpi_dev_name(adev));
-		put_device(&adev->dev);
-		dai_links[0].codecs->name = codec_name;
-
-		/* also fixup codec dai name if relevant */
-		if (!strncmp(mach->id, "ESSX8326", SND_ACPI_I2C_ID_LEN))
-			dai_links[0].codecs->dai_name = "ES8326 HiFi";
-	} else {
-		dev_err(dev, "Error cannot find '%s' dev\n", mach->id);
-		return -ENXIO;
-	}
-
-	ret = snd_soc_fixup_dai_links_platform_name(&sof_es8336_card,
-						    mach->mach_params.platform);
-	if (ret)
-		return ret;
-
-	codec_dev = acpi_get_first_physical_node(adev);
-	if (!codec_dev)
-		return -EPROBE_DEFER;
-	priv->codec_dev = get_device(codec_dev);
-
-	if (quirk & SOF_ES8336_JD_INVERTED)
-		props[cnt++] = PROPERTY_ENTRY_BOOL("everest,jack-detect-inverted");
-
-	if (cnt) {
-		fwnode = fwnode_create_software_node(props, NULL);
-		if (IS_ERR(fwnode)) {
-			put_device(codec_dev);
-			return PTR_ERR(fwnode);
-		}
-
-		ret = device_add_software_node(codec_dev, to_software_node(fwnode));
-
-		fwnode_handle_put(fwnode);
-
-		if (ret) {
-			put_device(codec_dev);
-			return ret;
-		}
-	}
-
-	/* get speaker enable GPIO */
-	ret = devm_acpi_dev_add_driver_gpios(codec_dev, gpio_mapping);
-	if (ret)
-		dev_warn(codec_dev, "unable to add GPIO mapping table\n");
-
-	priv->gpio_speakers = gpiod_get_optional(codec_dev, "speakers-enable", GPIOD_OUT_LOW);
-	if (IS_ERR(priv->gpio_speakers)) {
-		ret = dev_err_probe(dev, PTR_ERR(priv->gpio_speakers),
-				    "could not get speakers-enable GPIO\n");
-		goto err_put_codec;
-	}
-
-	priv->gpio_headphone = gpiod_get_optional(codec_dev, "headphone-enable", GPIOD_OUT_LOW);
-	if (IS_ERR(priv->gpio_headphone)) {
-		ret = dev_err_probe(dev, PTR_ERR(priv->gpio_headphone),
-				    "could not get headphone-enable GPIO\n");
-		goto err_put_codec;
-	}
-
-	INIT_LIST_HEAD(&priv->hdmi_pcm_list);
-
-	snd_soc_card_set_drvdata(card, priv);
-
-	if (mach->mach_params.dmic_num > 0) {
-		snprintf(soc_components, sizeof(soc_components),
-			 "cfg-dmics:%d", mach->mach_params.dmic_num);
-		card->components = soc_components;
-	}
-
-	ret = devm_snd_soc_register_card(dev, card);
+	ret = clk_prepare_enable(es8316->mclk);
 	if (ret) {
-		gpiod_put(priv->gpio_speakers);
-		dev_err(dev, "snd_soc_register_card failed: %d\n", ret);
-		goto err_put_codec;
+		dev_err(component->dev, "unable to enable mclk\n");
+		return ret;
 	}
-	platform_set_drvdata(pdev, &sof_es8336_card);
-	return 0;
 
-err_put_codec:
-	device_remove_software_node(priv->codec_dev);
-	put_device(codec_dev);
-	return ret;
+	/* Reset codec and enable current state machine */
+	snd_soc_component_write(component, ES8316_RESET, 0x3f);
+	usleep_range(5000, 5500);
+	snd_soc_component_write(component, ES8316_RESET, ES8316_RESET_CSM_ON);
+	msleep(30);
+
+	/*
+	 * Documentation is unclear, but this value from the vendor driver is
+	 * needed otherwise audio output is silent.
+	 */
+	snd_soc_component_write(component, ES8316_SYS_VMIDSEL, 0xff);
+
+	/*
+	 * Documentation for this register is unclear and incomplete,
+	 * but here is a vendor-provided value that improves volume
+	 * and quality for Intel CHT platforms.
+	 */
+	snd_soc_component_write(component, ES8316_CLKMGR_ADCOSR, 0x32);
+
+	return 0;
 }
 
-static int sof_es8336_remove(struct platform_device *pdev)
+static void es8316_remove(struct snd_soc_component *component)
 {
-	struct snd_soc_card *card = platform_get_drvdata(pdev);
-	struct sof_es8336_private *priv = snd_soc_card_get_drvdata(card);
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
 
-	gpiod_put(priv->gpio_speakers);
-	device_remove_software_node(priv->codec_dev);
-	put_device(priv->codec_dev);
+	clk_disable_unprepare(es8316->mclk);
+}
+
+static int es8316_resume(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
+
+	regcache_cache_only(es8316->regmap, false);
+	regcache_sync(es8316->regmap);
 
 	return 0;
 }
 
-static struct platform_driver sof_es8336_driver = {
-	.driver = {
-		.name = "sof-essx8336",
-		.pm = &snd_soc_pm_ops,
-	},
-	.probe = sof_es8336_probe,
-	.remove = sof_es8336_remove,
-};
-module_platform_driver(sof_es8336_driver);
+static int es8316_suspend(struct snd_soc_component *component)
+{
+	struct es8316_priv *es8316 = snd_soc_component_get_drvdata(component);
 
-MODULE_DESCRIPTION("ASoC Intel(R) SOF + ES8336 Machine driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:sof-essx8336");
-MODULE_IMPORT_NS(SND_SOC_INTEL_HDA_DSP_COMMON);
+	regcache_cache_only(es8316->regmap, true);
+	regcache_mark_dirty(es8316->regmap);
+
+	return 0;
+}
+
+static const struct snd_soc_component_driver soc_component_dev_es8316 = {
+	.probe			= es8316_probe,
+	.remove			= es8316_remove,
+	.resume			= es8316_resume,
+	.suspend		= es8316_suspend,
+	.set_jack		= es8316_set_jack,
+	.controls		= es8316_snd_controls,
+	.num_controls		= ARRAY_SIZE(es8316_snd_controls),
+	.dapm_widgets		= es8316_dapm_widgets,
+	.num_dapm_widgets	= ARRAY_SIZE(es8316_dapm_widgets),
+	.dapm_routes		= es8316_dapm_routes,
+	.num_dapm_routes	= ARRAY_SIZE(es8316_dapm_routes),
+	.use_pmdown_time	= 1,
+	.endianness		= 1,
+};
+
+static const struct regmap_range es8316_volatile_ranges[] = {
+	regmap_reg_range(ES8316_GPIO_FLAG, ES8316_GPIO_FLAG),
+};
+
+static const struct regmap_access_table es8316_volatile_table = {
+	.yes_ranges	= es8316_volatile_ranges,
+	.n_yes_ranges	= ARRAY_SIZE(es8316_volatile_ranges),
+};
+
+static const struct regmap_config es8316_regmap = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.use_single_read = true,
+	.use_single_write = true,
+	.max_register = 0x53,
+	.volatile_table	= &es8316_volatile_table,
+	.cache_type = REGCACHE_RBTREE,
+};
+
+static int es8316_i2c_probe(struct i2c_client *i2c_client)
+{
+	struct device *dev = &i2c_client->dev;
+	struct es8316_priv *es8316;
+	int ret;
+
+	es8316 = devm_kzalloc(&i2c_client->dev, sizeof(struct es8316_priv),
+			      GFP_KERNEL);
+	if (es8316 == NULL)
+		return -ENOMEM;
+
+	i2c_set_clientdata(i2c_client, es8316);
+
+	es8316->regmap = devm_regmap_init_i2c(i2c_client, &es8316_regmap);
+	if (IS_ERR(es8316->regmap))
+		return PTR_ERR(es8316->regmap);
+
+	es8316->irq = i2c_client->irq;
+	mutex_init(&es8316->lock);
+
+	ret = devm_request_threaded_irq(dev, es8316->irq, NULL, es8316_irq,
+					IRQF_TRIGGER_HIGH | IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					"es8316", es8316);
+	if (ret) {
+		dev_warn(dev, "Failed to get IRQ %d: %d\n", es8316->irq, ret);
+		es8316->irq = -ENXIO;
+	}
+
+	return devm_snd_soc_register_component(&i2c_client->dev,
+				      &soc_component_dev_es8316,
+				      &es8316_dai, 1);
+}
+
+static const struct i2c_device_id es8316_i2c_id[] = {
+	{"es8316", 0 },
+	{}
+};
+MODULE_DEVICE_TABLE(i2c, es8316_i2c_id);
+
+#ifdef CONFIG_OF
+static const struct of_device_id es8316_of_match[] = {
+	{ .compatible = "everest,es8316", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, es8316_of_match);
+#endif
+
+#ifdef CONFIG_ACPI
+static const struct acpi_device_id es8316_acpi_match[] = {
+	{"ESSX8316", 0},
+	{"ESSX8336", 0},
+	{},
+};
+MODULE_DEVICE_TABLE(acpi, es8316_acpi_match);
+#endif
+
+static struct i2c_driver es8316_i2c_driver = {
+	.driver = {
+		.name			= "es8316",
+		.acpi_match_table	= ACPI_PTR(es8316_acpi_match),
+		.of_match_table		= of_match_ptr(es8316_of_match),
+	},
+	.probe_new	= es8316_i2c_probe,
+	.id_table	= es8316_i2c_id,
+};
+module_i2c_driver(es8316_i2c_driver);
+
+MODULE_DESCRIPTION("Everest Semi ES8316 ALSA SoC Codec Driver");
+MODULE_AUTHOR("David Yang <yangxiaohua@everest-semi.com>");
+MODULE_LICENSE("GPL v2");
